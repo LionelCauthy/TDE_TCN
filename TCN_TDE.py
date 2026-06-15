@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 class CausalConv1d(nn.Module):
     """非因果1D卷积（实际为对称因果卷积，用于构建非因果TCN）"""
     # TODO : 补零方式选取
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1,pad_mode='zeros'):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1,pad_mode="zeros"):
         super(CausalConv1d, self).__init__()
         # 计算对称padding，确保感受野对称
         padding = (kernel_size - 1) * dilation // 2
@@ -338,13 +338,8 @@ if __name__ == "__main__":
     BATCH_SIZE = 32
 
     # 创建网络
-    model = NonCausalTCN(
-        input_channels=2,
-        num_layers=6,
-        hidden_channels=64,
-        kernel_size=3,
-        max_delay=MAX_DELAY,
-        dropout=0.2
+    model = TCN(
+        input_dim=2,enc_dim=64,bottle_neck_dim=16,hidden_dim=64,layer=6,stack=2,max_delay=MAX_DELAY,
     )
 
 

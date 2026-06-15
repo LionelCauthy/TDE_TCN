@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 class CausalConv1d(nn.Module):
     """非因果1D卷积（实际为对称因果卷积，用于构建非因果TCN）"""
     # TODO : 补零方式选取
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1,pad_mode="zeros"):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1,pad_mode=1):
         super(CausalConv1d, self).__init__()
         # 计算对称padding，确保感受野对称
         padding = (kernel_size - 1) * dilation // 2
@@ -18,7 +18,7 @@ class CausalConv1d(nn.Module):
             kernel_size,
             padding=padding,
             dilation=dilation,
-            padding_mode=pad_mode,
+            padding_mode= "zeros" if pad_mode else "circular",
         )
 
     def forward(self, x):
@@ -77,28 +77,6 @@ class ResidualConvBlock(nn.Module):
             return residual
 
 
-
-
-    def forward(self, x):
-        # 保存原始输入用于残差连接
-        residual = x
-
-        # 第一卷积层 + 激活
-        out = self.conv1(x)
-        out = self.relu(out)
-        out = self.dropout(out)
-
-        # 第二卷积层 + 激活
-        out = self.conv2(out)
-        out = self.relu(out)
-        out = self.dropout(out)
-
-        # 调整残差连接的通道数（如果需要）
-        if self.channel_adjust is not None:
-            residual = self.channel_adjust(residual)
-
-        # 残差连接
-        return out + residual
 
 # class OldTCN(nn.Module):
 #     def __init__(self, input_dim, output_dim, BN_dim, hidden_dim,
@@ -191,7 +169,7 @@ class TCN(nn.Module):
         self.norm = GLN(enc_dim, 1)
         self.act = nn.PReLU()
         self.bottle_neck = nn.Conv1d(enc_dim, bottle_neck_dim, 1)
-
+        self.de_bottle_neck = nn.Conv1d(bottle_neck_dim, hidden_dim, 1)
         # TCN for feature extraction
         self.receptive_field = 0
 
@@ -201,7 +179,7 @@ class TCN(nn.Module):
             for i in range(layer):
                 dil = 2 ** i
                 padding = (kernel - 1) * dil // 2
-                self.TCN.append(
+                self.TCNStack.append(
                 ResidualConvBlock(bottle_neck_dim, hidden_dim, padding_size=padding, dilation=dil, kernel_size=kernel,
                                           skip=skip, ))
                 if i == 0 and s == 0:
@@ -243,11 +221,13 @@ class TCN(nn.Module):
 
         # 输出层
         if self.skip:
+            skip_connection = self.de_bottle_neck(self.act(skip_connection))
             skip_connection = skip_connection.mean(dim=-1, keepdim=True) # (batch, hidden_dim, 1)
-            output = self.end_conv(self.act(skip_connection)) # (batch, delays, 1)
+            output = self.end_conv(skip_connection) # (batch, delays, 1)
         else:
+            output = self.de_bottle_neck(self.act(output))
             output = output.mean(dim=-1, keepdim=True)
-            output = self.end_conv(self.act(output))
+            output = self.end_conv(output)
 
         output = output.squeeze(-1)  # (batch, output_size)
 
@@ -318,16 +298,17 @@ def tcn_loss(prediction, delay, max_delay, sigma=2.0, lambda_gauss=0.7, lambda_l
     # 计算预测分布的期望时延
     expected_delay = torch.sum(prediction * delays, dim=1)
     # 计算L1误差
-    l1_loss = F.l1_loss(expected_delay, delay.float())
+    l1_loss = F.smooth_l1_loss(expected_delay, delay.float())
 
     # 组合损失
     total_loss = lambda_gauss * gauss_loss + lambda_l1 * l1_loss
 
-    return total_loss, {
-        'gauss_loss': gauss_loss.item(),
-        'l1_loss': l1_loss.item(),
-        'expected_delay': expected_delay.detach()
-    }
+    # return total_loss, {
+    #     'gauss_loss': gauss_loss.item(),
+    #     'l1_loss': l1_loss.item(),
+    #     'expected_delay': expected_delay.detach()
+    # }
+    return total_loss
 
 
 # 示例用法
@@ -370,7 +351,7 @@ if __name__ == "__main__":
             inputs.append(input_data)
             delays.append(delay)
 
-        return torch.tensor(inputs, dtype=torch.float32), torch.tensor(delays, dtype=torch.float32)
+        return torch.tensor(np.array(inputs), dtype=torch.float32), torch.tensor(np.array(delays), dtype=torch.float32)
 
 
     # 测试前向传播
@@ -388,7 +369,11 @@ if __name__ == "__main__":
     print(f"L1误差: {loss_details['l1_loss']:.6f}")
 
     # 可视化示例
-    plt.figure(figsize=(12, 8))
+    plt.figure(figsize=(12.0,8.0))
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+
+    # 2. 解决负号 '-' 显示为方块的问题（强烈建议加上）
+    plt.rcParams['axes.unicode_minus'] = False
 
     # 1. 可视化输入信号
     plt.subplot(3, 1, 1)

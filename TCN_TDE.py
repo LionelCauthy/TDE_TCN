@@ -290,7 +290,7 @@ def tcn_loss(prediction, delay, max_delay, sigma=2.0, lambda_gauss=0.7, lambda_l
     """
     # 1. 高斯分布误差 (MSE between predicted and target distributions)
     target_gauss = create_gaussian_label(delay, max_delay, sigma)
-    gauss_loss = F.mse_loss(prediction, target_gauss)
+    gauss_loss = F.kl_div(prediction, target_gauss,reduction='batchmean')
 
     # 2. 期望L1误差
     # 创建时延轴

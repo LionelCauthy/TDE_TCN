@@ -67,8 +67,8 @@ class ResidualConvBlock(nn.Module):
                                                         skip_connection
         # TODO : 最后输出没有激活层
         """
-        output = self.norm(self.act(self.bottle_neck(input)))
-        output = self.norm(self.act(self.depth_wise_conv1d(output)))
+        output = self.act(self.norm(self.bottle_neck(input)))
+        output = self.act(self.norm(self.depth_wise_conv1d(output)))
         residual = self.res_out(output)
         if self.skip:
             skip = self.skip_out(output)
@@ -77,69 +77,6 @@ class ResidualConvBlock(nn.Module):
             return residual
 
 
-
-# class OldTCN(nn.Module):
-#     def __init__(self, input_dim, output_dim, BN_dim, hidden_dim,
-#                  layer, stack, kernel=3, skip=True):
-#         super(OldTCN, self).__init__()
-#
-#         # input is a sequence of features of shape (B, N, L)
-#         self.skip = skip
-#         # normalization
-#
-#         self.norm = GLN(input_dim, 1)
-#
-#         self.bottle_neck = nn.Conv1d(input_dim, BN_dim, 1)
-#
-#         # TCN for feature extraction
-#         self.receptive_field = 0
-#
-#         self.TCN = nn.ModuleList([])
-#         for s in range(stack):
-#             for i in range(layer):
-#                 if self.dilated:
-#                     self.TCN.append(ResidualConvBlock(BN_dim, hidden_dim, padding_size=2 ** i,dilation=2 ** i,kernel_size= kernel, skip=skip,))
-#                 if i == 0 and s == 0:
-#                     self.receptive_field += kernel
-#                 else:
-#                     if self.dilated:
-#                         self.receptive_field += (kernel - 1) * 2 ** i
-#
-#         # print("Receptive field: {:3d} frames.".format(self.receptive_field))
-#
-#         # output layer
-#
-#         self.output = nn.Sequential(nn.PReLU(),
-#                                     nn.Conv1d(BN_dim, output_dim, 1))
-#
-#
-#
-#     def forward(self, input):
-#
-#         # input shape: (B, N, L)
-#
-#         # normalization
-#         output = self.BN(self.LN(input))
-#
-#         # pass to TCN
-#         if self.skip:
-#             skip_connection = 0.
-#             for i in range(len(self.TCN)):
-#                 residual, skip = self.TCN[i](output)
-#                 output = output + residual
-#                 skip_connection = skip_connection + skip
-#         else:
-#             for i in range(len(self.TCN)):
-#                 residual = self.TCN[i](output)
-#                 output = output + residual
-#
-#         # output layer
-#         if self.skip:
-#             output = self.output(skip_connection)
-#         else:
-#             output = self.output(output)
-#
-#         return output
 
 class TCN(nn.Module):
     """一维非因果TCN时延估计网络"""
@@ -161,9 +98,9 @@ class TCN(nn.Module):
         self.output_size = 2 * max_delay + 1  # 时延范围: [-max_delay, max_delay]
 
         # 初始投影层（将2通道映射到隐藏维度）
-        self.start_conv = nn.Conv1d(input_dim, enc_dim, kernel_size=1, bias=False)
+        # self.start_conv = nn.Conv1d(input_dim, enc_dim, kernel_size=1, bias=False)
         # TODO : 是否需要滑动窗口
-        # self.start_conv = nn.Conv1d(input_dim,enc_dim,kernel_size=20,stride=10,padding_mode='zeros',bias=False)
+        self.start_conv = nn.Conv1d(input_dim,enc_dim,kernel_size=16,stride=8,padding=8,padding_mode='zeros',bias=False)
 
 
         self.norm = GLN(enc_dim, 1)
@@ -222,7 +159,7 @@ class TCN(nn.Module):
         # 输出层
         if self.skip:
             skip_connection = self.de_bottle_neck(self.act(skip_connection))
-            skip_connection = skip_connection.mean(dim=-1, keepdim=True) # (batch, hidden_dim, 1)
+            skip_connection = skip_connection.max(dim=-1, keepdim=True)[0] # (batch, hidden_dim, 1)
             output = self.end_conv(skip_connection) # (batch, delays, 1)
         else:
             output = self.de_bottle_neck(self.act(output))
@@ -234,20 +171,34 @@ class TCN(nn.Module):
         # 归一化为概率分布
         return self.softmax(output)
 
-        # 通过TCN块
-        # skip_connections = []
-        # for block in self.tcn_blocks:
-        #     x = block(x)
-        #     # 收集跳跃连接特征
-        #     skip_connections.append(self.global_pool(x).squeeze(-1))
-        #
-        # # 聚合跳跃连接
-        # if skip_connections:
-        #     x = torch.stack(skip_connections, dim=-1).mean(dim=-1)
-        # else:
-        #     x = self.global_pool(x).squeeze(-1)
 
 
+def tcn_loss(prediction, delay, max_delay, sigma=2.0, lambda_gauss=0.7, lambda_l1=0.3):
+    """
+    复合损失函数
+    prediction: 网络预测的时延分布 (batch_size, output_size)
+    delay: 真实时延 (batch_size,)
+    max_delay: 最大可能时延
+    sigma: 高斯分布标准差
+    lambda_gauss: 高斯分布误差权重
+    lambda_l1: 期望L1误差权重
+    """
+    # 1. 高斯分布误差 (MSE between predicted and target distributions)
+    target_gauss = create_gaussian_label(delay, max_delay, sigma)
+    gauss_loss = F.mse_loss(prediction, target_gauss)
+
+    # 2. 期望L1误差
+    # 创建时延轴
+    delays = torch.arange(-max_delay, max_delay + 1, device=prediction.device, dtype=torch.float32)
+    # 计算预测分布的期望时延
+    expected_delay = torch.sum(prediction * delays, dim=1)
+    # 计算L1误差
+    l1_loss = F.l1_loss(expected_delay, delay.float())
+
+    # 组合损失
+    total_loss = lambda_gauss * gauss_loss + lambda_l1 * l1_loss
+
+    return total_loss
 
 
 
@@ -278,36 +229,63 @@ def create_gaussian_label(delay, max_delay, sigma=2.0):
     return gaussian
 
 
-def tcn_loss(prediction, delay, max_delay, sigma=2.0, lambda_gauss=0.7, lambda_l1=0.3):
+def spatial_diffusion_loss(prediction, delay, max_delay, sigma=2.0, lambda_diff=0.6, lambda_l1=0.3,logit_reg_weight=0.1):
     """
-    复合损失函数
-    prediction: 网络预测的时延分布 (batch_size, output_size)
+    空间扩散损失 + 期望L1损失 复合损失函数
+    prediction: 网络预测的时延分布 (batch_size, output_size)，需经过 log_softmax 或 softmax
     delay: 真实时延 (batch_size,)
-    max_delay: 最大可能时延
-    sigma: 高斯分布标准差
-    lambda_gauss: 高斯分布误差权重
+    max_delay: 最大可能时延 (用于构建时延轴)
+    sigma: 空间扩散的容忍半径 (控制惩罚的衰减速度)
+    lambda_diff: 空间扩散损失权重
     lambda_l1: 期望L1误差权重
     """
-    # 1. 高斯分布误差 (MSE between predicted and target distributions)
-    target_gauss = create_gaussian_label(delay, max_delay, sigma)
-    gauss_loss = F.kl_div(prediction, target_gauss,reduction='batchmean')
 
-    # 2. 期望L1误差
-    # 创建时延轴
+    # 1. 空间扩散损失 (Spatial Diffusion Loss)
+    # 构建时延轴，使其与 prediction 的维度对齐
+    # 假设 prediction 的 output_size 对应 [-max_delay, max_delay]
     delays = torch.arange(-max_delay, max_delay + 1, device=prediction.device, dtype=torch.float32)
-    # 计算预测分布的期望时延
-    expected_delay = torch.sum(prediction * delays, dim=1)
-    # 计算L1误差
+    delays = delays.unsqueeze(0)  # (1, output_size)
+    delay_true = delay.float().unsqueeze(1)  # (batch_size, 1)
+
+    # 计算预测分布中每个 bin 到真实时延的距离
+    distance = torch.abs(delays - delay_true)  # (batch_size, output_size)
+
+    # 将距离转化为空间扩散惩罚权重 (使用高斯核或指数衰减)
+    # 距离真实值越远，惩罚权重越大；在 sigma 范围内惩罚较小
+    # 这里使用 1 - exp(-d^2 / 2sigma^2)，距离为0时惩罚为0，距离远时惩罚趋近于1
+    diffusion_penalty = 1.0 - torch.exp(-(distance ** 2) / (2.0 * sigma ** 2))
+
+    # 预测的真实概率 (exp(log_prob))
+    pred_prob = prediction
+
+    # 空间扩散损失 = 预测概率 * 扩散惩罚 的期望
+    # 即：模型把概率分配给远离真实值的地方越多，loss越大
+    diff_loss = torch.sum(pred_prob * diffusion_penalty, dim=1).mean()
+
+
+    # 2. 计算数学期望 E
+    expected_values = torch.sum(pred_prob * delays, dim=-1)
+
+    # ==========================================
+    # 5. 终极杀招：Logit 级直接惩罚 (Logit Regularization)
+    # ==========================================
+    # 绕过 Softmax，直接对距离目标较远(比如距离>5)且 Logit 偏高的节点进行暴力镇压
+    # 这确保了即使网络非常固执，也能强行把假峰的特征响应打下去
+
+    # 创建一个掩码，标记出距离真实目标大于 5.0 的区域为 1 (需要惩罚的区域)
+    far_away_mask = (distance > 5.0).float()
+
+    # 只惩罚大于 0 的 Logit (使用 ReLU)，使得网络不敢在远端乱给正反馈
+    # 使用 MSE 形式的平方惩罚，置信度越高的假峰惩罚越惨烈
+    logit_penalty = (F.relu(prediction) ** 2 * far_away_mask).mean()
+
+    # 2. 期望L1误差 (保持原逻辑)
+    expected_delay = torch.sum(pred_prob * delays, dim=1)
     l1_loss = F.smooth_l1_loss(expected_delay, delay.float())
 
-    # 组合损失
-    total_loss = lambda_gauss * gauss_loss + lambda_l1 * l1_loss
+    # 3. 组合损失
+    total_loss = lambda_diff * diff_loss + lambda_l1 * l1_loss+ logit_reg_weight * logit_penalty
 
-    # return total_loss, {
-    #     'gauss_loss': gauss_loss.item(),
-    #     'l1_loss': l1_loss.item(),
-    #     'expected_delay': expected_delay.detach()
-    # }
     return total_loss
 
 

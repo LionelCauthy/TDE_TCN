@@ -156,10 +156,28 @@ class TCN(nn.Module):
                 residual = self.TCNStack[i](output)
                 output = output + residual
 
+
+        # if self.skip:
+        #     skip_connection = self.de_bottle_neck(self.act(skip_connection)) # (batch, hidden_dim, seq_len)
+        #     output = self.end_conv(skip_connection) # (batch, delays, seq_len)
+        # else:
+        #     output = self.de_bottle_neck(self.act(output))
+        #     output = self.end_conv(output)
+        #
+        # # output = output.squeeze(-1)  # (batch, output_size)
+        # probs_distribution = F.softmax(output, dim=1)
+        # max_probs, est_indices = torch.max(probs_distribution, dim=1)
+        #
+        # # 将索引 (0 到 2*max_delay) 转换为实际的时延值 (-max_delay 到 +max_delay)
+        # estimated_delays = est_indices - self.max_delay
+        #
+        # return estimated_delays, max_probs, probs_distribution
+
+
         # 输出层
         if self.skip:
             skip_connection = self.de_bottle_neck(self.act(skip_connection))
-            skip_connection = skip_connection.max(dim=-1, keepdim=True)[0] # (batch, hidden_dim, 1)
+            skip_connection = skip_connection.mean(dim=-1, keepdim=True) # (batch, hidden_dim, 1)
             output = self.end_conv(skip_connection) # (batch, delays, 1)
         else:
             output = self.de_bottle_neck(self.act(output))

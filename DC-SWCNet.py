@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import torch
 import os
 import torch.nn as nn
@@ -694,3 +695,366 @@ def overfit_single_batch_test(model):
             check_network_is_alive(model)
 
         optimizer.step()
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm.notebook import tqdm
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+
+def generate_simulation_data(batch_size, window_size=4000, max_delay=100, max_points=3):
+    """
+    生成模拟的 MZ-Sagnac 多点重叠扰动数据及一维高斯热力图标签
+    采样率参考 5 MSa/s [cite: 825]。
+    """
+    X = torch.zeros(batch_size, 2, window_size)
+    # 标签热力图：长度为 2 * max_delay + 1 的一维数组
+    Y_heatmap = torch.zeros(batch_size, 2 * max_delay + 1)
+
+    t = np.arange(window_size)
+
+    for b in range(batch_size):
+        num_points = np.random.randint(1, max_points + 1)
+        x_signal = np.zeros(window_size)
+        y_signal = np.zeros(window_size)
+
+        for p in range(num_points):
+            # 模拟随机延迟和随机起振时间，制造严重的 Temporal Overlap
+            delay = np.random.randint(-max_delay + 10, max_delay - 10)
+            onset = np.random.randint(100, window_size - 1000)
+
+            # 多频混合瞬态衰减信号
+            A = np.random.uniform(0.5, 1.5)
+            alpha = np.random.uniform(0.001, 0.005)
+            freqs = [np.random.uniform(0.01, 0.05), np.random.uniform(0.1, 0.2)]
+
+            # 构造 x(t)
+            x_component = np.zeros(window_size)
+            envelope = A * np.exp(-alpha * (t[onset:] - onset))
+            for f in freqs:
+                x_component[onset:] += envelope * np.sin(2 * np.pi * f * (t[onset:] - onset))
+
+            # 构造 y(t) = x(t - delay)
+            y_component = np.roll(x_component, delay)
+
+            x_signal += x_component
+            y_signal += y_component
+
+            # 在对应延迟位置渲染一维高斯分布 (Sigma = 2.0)
+            # 避免直接回归造成的偏移，利用高斯分布引导网络学习平滑特征
+            center = delay + max_delay
+            sigma = 2.0
+            x_grid = np.arange(2 * max_delay + 1)
+            gaussian = np.exp(-((x_grid - center) ** 2) / (2 * sigma ** 2))
+
+            # 取多点高斯峰的最大值（如果峰重叠）
+            # 这里认为当多个峰同时存在时，选择最大者，
+            # 网络最终的输出要和这个热力图进行拟合
+            Y_heatmap[b] = torch.max(Y_heatmap[b], torch.tensor(gaussian, dtype=torch.float32))
+
+        # 添加高斯白噪声
+        X[b, 0, :] = torch.tensor(x_signal) + torch.randn(window_size) * 0.05
+        X[b, 1, :] = torch.tensor(y_signal) + torch.randn(window_size) * 0.05
+
+    return X, Y_heatmap
+
+
+class NonCausalDilatedConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
+        super().__init__()
+        # 严格计算对称 Padding，确保非因果性（零相位偏移）
+        padding = dilation * (kernel_size - 1) // 2
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
+                              padding=padding, dilation=dilation, bias=False)
+        self.bn = nn.GroupNorm(1,out_channels,1e-8)
+        self.relu = nn.PReLU()
+
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+
+class FeatureCorrelationLayer(nn.Module):
+    def __init__(self, max_delay):
+        super().__init__()
+        self.max_delay = max_delay
+
+    def forward(self, f_x, f_y):
+        """
+        计算特征级别的互相关。
+        输入维度: [B, C, L]
+        输出维度: [B, C, 2*max_delay + 1]
+        """
+        B, C, L = f_x.size()
+        correlations = []
+
+        # 归一化特征，类似于原文公式(7)
+        f_x = F.normalize(f_x, p=2, dim=2)
+        f_y = F.normalize(f_y, p=2, dim=2)
+
+        # 在特征维度进行不同 shift 的滑动点乘
+        for shift in range(-self.max_delay, self.max_delay + 1):
+            if shift < 0:
+                x_shift = f_x[:, :, :shift]
+                y_shift = f_y[:, :, -shift:]
+            elif shift > 0:
+                x_shift = f_x[:, :, shift:]
+                y_shift = f_y[:, :, :-shift]
+            else:
+                x_shift = f_x
+                y_shift = f_y
+
+            # 计算相似度并对时间维度求和
+            corr = torch.sum(x_shift * y_shift, dim=2, keepdim=True)  # [B, C, 1]
+            correlations.append(corr)
+
+        return torch.cat(correlations, dim=2)  # [B, C, 2*max_delay + 1]
+
+
+class OptimizedFeatureCorrelationLayer(nn.Module):
+    def __init__(self, max_delay):
+        super().__init__()
+        self.max_delay = max_delay
+
+    def forward(self, f_x, f_y):
+        """
+        利用 F.conv1d 和 Grouped Convolution 极致优化计算图的互相关
+        输入维度: f_x, f_y -> [B, C, L]
+        输出维度: [B, C, 2*max_delay + 1]
+        """
+        B, C, L = f_x.size()
+
+        # 1. 归一化 (计算 Cosine 相似度必备)
+        f_x = F.normalize(f_x, p=2, dim=2)
+        f_y = F.normalize(f_y, p=2, dim=2)
+
+        # 2. 维度重构技巧
+        # 互相关是在 x 上滑动 y。为了用 F.conv1d 批量处理，
+        # 我们把 f_x 作为 "Input"，把 f_y 作为 "Weight"。
+        # 为了不让不同 Batch 和不同 Channel 相互干扰，我们使用 分组卷积 (groups = B * C)
+
+        # 将 f_x 展平为单 Batch，包含 B*C 个独立的组
+        # 维度变换: [B, C, L] -> [1, B*C, L]
+        f_x_reshaped = f_x.view(1, B * C, L)
+
+        # 对 f_x 进行两侧 Padding，以容纳左右方向的 shift
+        f_x_padded = F.pad(f_x_reshaped, (self.max_delay, self.max_delay))
+
+        # 将 f_y 展平为独立的三维权重核，每个核对应一个组
+        # F.conv1d 的 weight 维度要求: [out_channels, in_channels/groups, kernel_size]
+        # 维度变换: [B, C, L] -> [B*C, 1, L]
+        f_y_reshaped = f_y.view(B * C, 1, L)
+
+        # 3. 使用底层 CUDA 算子计算互相关
+        # 由于 kernel_size = L，滑动窗口为 2*max_delay + 1
+        corr = F.conv1d(f_x_padded, f_y_reshaped, groups=B * C)
+
+        # 4. 恢复输出维度: [1, B*C, 2*max_delay + 1] -> [B, C, 2*max_delay + 1]
+        corr = corr.view(B, C, -1)
+
+        return corr
+
+
+class DC_SWCNet(nn.Module):
+    def __init__(self, max_delay=100, feature_dim=32):
+        super().__init__()
+        self.max_delay = max_delay
+
+        # 将双通道输入分离，但在同一骨干网络中共享权重提取特征
+        self.feature_extractor = nn.Sequential(
+            NonCausalDilatedConv1d(1, 16, kernel_size=5, dilation=1),
+            NonCausalDilatedConv1d(16, 32, kernel_size=5, dilation=2),
+            NonCausalDilatedConv1d(32, feature_dim, kernel_size=5, dilation=4),
+            NonCausalDilatedConv1d(feature_dim, feature_dim, kernel_size=5, dilation=8),
+            NonCausalDilatedConv1d(feature_dim, feature_dim, kernel_size=5, dilation=16),
+            NonCausalDilatedConv1d(feature_dim, feature_dim, kernel_size=5, dilation=32),
+        )
+
+        self.channel_attention = ChannelAttention(feature_dim)
+        self.correlation_layer = FeatureCorrelationLayer(max_delay)
+
+        # 1D 预测头：将多通道相关性压缩为一维最终时延热力图
+        self.prediction_head = nn.Sequential(
+            nn.Conv1d(feature_dim, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(16, 1, kernel_size=1),
+            nn.Sigmoid()  # 输出 0-1 的概率
+        )
+
+    def forward(self, x):
+        # x 维度: [B, 2, L]
+        x_ch = x[:, 0:1, :]
+        y_ch = x[:, 1:2, :]
+
+        # 分别提取高维特征
+        f_x = self.feature_extractor(x_ch)
+        f_y = self.feature_extractor(y_ch)
+
+        # 利用通道注意力，自动压制发生严重低频串扰的通道，提升干净瞬态通道权重
+        f_x = self.channel_attention(f_x)
+        f_y = self.channel_attention(f_y)
+
+        # 特征互相关
+        corr_matrix = self.correlation_layer(f_x, f_y)  # [B, C, 2*max_delay+1]
+
+        # 输出一维热力图
+        heatmap = self.prediction_head(corr_matrix).squeeze(1)  # [B, 2*max_delay+1]
+        return heatmap
+
+def extract_peaks_from_heatmap(heatmap, max_delay, threshold=0.5):
+    """
+    从一维热力图中提取时延峰值（支持多点、亚像素）
+    """
+    heatmap_np = heatmap.detach().cpu().numpy()
+    batch_peaks = []
+
+    for i in range(heatmap_np.shape[0]):
+        hm = heatmap_np[i]
+        # 寻找局部峰值 (一维 NMS)
+        peaks, properties = find_peaks(hm, height=threshold, distance=10)
+
+        sub_pixel_peaks = []
+        for p in peaks:
+            # 二次插值 (Quadratic Interpolation) 获取亚像素精度
+            if 0 < p < len(hm) - 1:
+                alpha = hm[p - 1]
+                beta = hm[p]
+                gamma = hm[p + 1]
+                # 抛物线顶点偏移量公式
+                offset = 0.5 * (alpha - gamma) / (alpha - 2 * beta + gamma)
+                exact_p = p + offset
+            else:
+                exact_p = p
+
+            # 还原为真实延迟时间 (-max_delay 到 +max_delay)
+            actual_delay = exact_p - max_delay
+            sub_pixel_peaks.append(actual_delay)
+
+        batch_peaks.append(sub_pixel_peaks)
+        # print(batch_peaks)
+
+    return batch_peaks
+
+
+def train_and_validate():
+    # 超参数配置
+    batch_size = 32
+    max_delay = 100
+    window_size = 4000
+    epochs = 200
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = DC_SWCNet(max_delay=max_delay).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+    # 采用高斯平滑后的 MSE Loss
+    criterion = nn.MSELoss()
+
+    print("开始训练 DC-ASWC-Net...")
+    for epoch in tqdm(range(epochs)):
+        model.train()
+        # 在线生成增强的仿真数据
+        inputs, targets = generate_simulation_data(batch_size, window_size, max_delay)
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+            # ... 前面的训练循环代码 ...
+
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch [{epoch + 1}/{epochs}], Training Loss: {loss.item():.6f}")
+
+            # --- 验证阶段 ---
+            model.eval()
+            with torch.no_grad():
+                val_inputs, val_targets = generate_simulation_data(4, window_size, max_delay)
+                val_inputs = val_inputs.to(device)
+                val_outputs = model(val_inputs)
+
+                print("验证批次时延预测结果:")
+                predicted_peaks = extract_peaks_from_heatmap(val_outputs, max_delay, threshold=0.4)
+                true_peaks = extract_peaks_from_heatmap(val_targets, max_delay, threshold=0.4)
+
+                for b in range(4):
+                    print(f"  样本 {b}:")
+                    print(f"    真实时延 : {['{:.2f}'.format(p) for p in true_peaks[b]]}")
+                    print(f"    预测时延 : {['{:.2f}'.format(p) for p in predicted_peaks[b]]}")
+
+                # ==========================================
+                # --- 新增：一维热力图输出可视化 ---
+                # ==========================================
+                # 将张量转移到 CPU 并转换为 NumPy 数组
+                targets_np = val_targets.cpu().numpy()
+                outputs_np = val_outputs.cpu().numpy()
+
+                # 构建 X 轴坐标 (从 -max_delay 到 +max_delay)
+                x_axis = np.arange(-max_delay, max_delay + 1)
+
+                # 创建 4 个子图，呈垂直排列
+                fig, axes = plt.subplots(4, 1, figsize=(10, 12))
+                fig.subplots_adjust(hspace=0.5)  # 增加子图之间的垂直间距
+
+                for i in range(4):
+                    # 绘制真实的 Target 高斯曲线 (绿色虚线)
+                    axes[i].plot(x_axis, targets_np[i], label='Target (Ground Truth)', color='green',
+                                 linestyle='--', linewidth=2)
+
+                    # 绘制网络的 Output 预测曲线 (红色实线)
+                    axes[i].plot(x_axis, outputs_np[i], label='Prediction (Output)', color='red', alpha=0.8,
+                                 linewidth=2)
+
+                    # 用垂直点划线标出提取到的确切峰值位置
+                    for tp in true_peaks[i]:
+                        axes[i].axvline(x=tp, color='green', linestyle=':', alpha=0.6)
+                    for pp in predicted_peaks[i]:
+                        axes[i].axvline(x=pp, color='red', linestyle=':', alpha=0.6)
+
+                    # 设置图表格式
+                    axes[i].set_title(f"Sample {i} - Heatmap Comparison")
+                    axes[i].set_xlabel("Time Delay (Sampling Points)")
+                    axes[i].set_ylabel("Probability Intensity")
+                    axes[i].legend(loc="upper right")
+                    axes[i].grid(True, alpha=0.3)
+
+                    # 固定 Y 轴范围，防止由于预测值过小导致坐标轴自动缩放引发的视觉误判
+                    axes[i].set_ylim(-0.1, 1.2)
+
+                plt.show()
+
+                # 释放内存，防止在长时间训练中因为重复创建绘图对象导致 OOM
+                plt.close(fig)
+
+                print("-" * 40)
+                    
+                    
+                    
+                    
+            print("-" * 40)
+
+
+if __name__ == "__main__":
+    train_and_validate()
+>>>>>>> c88a307 (cloud codes)

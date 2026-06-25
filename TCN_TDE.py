@@ -100,7 +100,11 @@ class TCN(nn.Module):
         # 初始投影层（将2通道映射到隐藏维度）
         # self.start_conv = nn.Conv1d(input_dim, enc_dim, kernel_size=1, bias=False)
         # TODO : 是否需要滑动窗口
+<<<<<<< HEAD
         self.start_conv = nn.Conv1d(input_dim,enc_dim,kernel_size=16,stride=8,padding=8,padding_mode='zeros',bias=False)
+=======
+        # self.start_conv = nn.Conv1d(input_dim,enc_dim,kernel_size=16,stride=8,padding=8,padding_mode='zeros',bias=False)
+>>>>>>> c88a307 (cloud codes)
 
 
         self.norm = GLN(enc_dim, 1)
@@ -163,6 +167,7 @@ class TCN(nn.Module):
         # else:
         #     output = self.de_bottle_neck(self.act(output))
         #     output = self.end_conv(output)
+<<<<<<< HEAD
         #
         # # output = output.squeeze(-1)  # (batch, output_size)
         # probs_distribution = F.softmax(output, dim=1)
@@ -171,6 +176,16 @@ class TCN(nn.Module):
         # # 将索引 (0 到 2*max_delay) 转换为实际的时延值 (-max_delay 到 +max_delay)
         # estimated_delays = est_indices - self.max_delay
         #
+=======
+        # 
+        # # output = output.squeeze(-1)  # (batch, output_size)
+        # probs_distribution = F.softmax(output, dim=1)
+        # max_probs, est_indices = torch.max(probs_distribution, dim=1)
+        # 
+        # # 将索引 (0 到 2*max_delay) 转换为实际的时延值 (-max_delay 到 +max_delay)
+        # estimated_delays = est_indices - self.max_delay
+        # 
+>>>>>>> c88a307 (cloud codes)
         # return estimated_delays, max_probs, probs_distribution
 
 
